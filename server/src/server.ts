@@ -845,10 +845,7 @@ function refreshDocument(document: TextDocument) {
 
     refreshProject(project);
     findDefUsagesForProject(project);
-  } else {
-    console.warn(`[refreshDocument] No project found for ${document.uri}`);
   }
-
   collectGlobalSymbols(projects);
   rescanEverything();
 }
