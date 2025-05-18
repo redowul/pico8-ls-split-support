@@ -6,8 +6,8 @@ import { AssignmentStatement, Chunk, ForGenericStatement, ForNumericStatement, F
 import { Bounds, boundsEqual, boundsSize, CodeLocation } from './types';
 import { ASTVisitor, VisitableASTNode } from './visitor';
 import { BuiltinConstants, Builtins } from './builtins';
-import { hasGlobalSymbol } from './workspace-symbols';
-import { addReference } from './workspace-references';
+import { getGlobalSymbols, hasGlobalSymbol } from './workspace-symbols';
+import { CodeSymbol } from './symbols';
 
 export type DefinitionsUsagesResult = {
   definitionsUsages: DefinitionsUsagesLookup,
@@ -48,66 +48,89 @@ export class DefinitionsUsagesLookup {
   add(loc: Bounds, defUs: DefinitionsUsages) {
     const line = this.getLine(loc.start.line);
 
-    // First check to make sure that there isn't already an item with that name/bounds
     for (const defUsages of line) {
-      if (defUsages.defUs.symbolName === defUs.symbolName
-        && boundsEqual(defUsages.loc, loc)) {
-        // Name & location is the same, so merge usages/definitions instead of adding them.
+      if (defUsages.defUs.symbolName === defUs.symbolName && boundsEqual(defUsages.loc, loc)) {
         this.addLocationsIfNotExists(defUs.definitions, defUsages.defUs.definitions);
         this.addLocationsIfNotExists(defUs.usages, defUsages.defUs.usages);
         return;
       }
     }
 
-    // If we've made it this far, it's not been found, so just add it
     line.push({ loc, defUs });
   }
 
   addLocationsIfNotExists(locs: Bounds[], list: Bounds[]) {
     for (const loc of locs) {
       let shouldAdd = true;
-
-      // Only adds the location if it isn't already in the list
       for (const item of list) {
         if (boundsEqual(loc, item)) {
           shouldAdd = false;
           break;
         }
       }
-
       if (shouldAdd) {
         list.push(loc);
       }
     }
   }
 
-  lookup(line: number, column: number): DefinitionsUsages | undefined {
+  lookup(line: number, column: number, lineText?: string): DefinitionsUsages | undefined {
     const defUsOnLine = this.lines[line];
 
-    // Can't find the line, don't bother adding it to the list, just return
-    if (!defUsOnLine) {
-      return undefined;
-    }
+    let found: DefinitionsUsagesWithLocation | undefined;
 
-    let found: DefinitionsUsagesWithLocation | undefined = undefined;
+    if (defUsOnLine) {
+      for (const def of defUsOnLine) {
+        const matches = line === def.loc.start.line
+          && column >= def.loc.start.column
+          && column <= def.loc.end.column;
 
-    for (const def of defUsOnLine) {
-      const matches = line === def.loc.start.line
-        && column >= def.loc.start.column
-        && column <= def.loc.end.column;
-
-      // Make sure we find the match with the narrowest bounds
-      // TODO: maybe keep the list sorted so this is more efficient
-      // (sorting would introduce more work in the AST scanning phase though)
-      const narrower = !found || boundsSize(found.loc) > boundsSize(def.loc);
-
-      if (matches && narrower) {
-        found = def;
+        const narrower = !found || boundsSize(found.loc) > boundsSize(def.loc);
+        if (matches && narrower) {
+          found = def;
+        }
       }
     }
 
-    return found?.defUs;
+    if (found) return found.defUs;
+
+    // Fallback: check global symbols if no local match
+    if (lineText !== undefined) {
+      const word = extractIdentifierAt(column, lineText);
+      if (word) {
+        const symbols: CodeSymbol[] = getGlobalSymbols(word);
+        if (symbols.length > 0) {
+          return {
+            symbolName: word,
+            definitions: symbols.map(s => s.loc),
+            usages: symbols.map(s => s.loc),
+          };
+        }
+      }
+    }
+
+    return undefined;
   }
+}
+
+function extractIdentifierAt(pos: number, text: string): string {
+  function isWordChar(c: string): boolean {
+    const code = c.charCodeAt(0);
+    return (
+      (code >= 65 && code <= 90) ||    // A–Z
+      (code >= 97 && code <= 122) ||   // a–z
+      (code >= 48 && code <= 57) ||    // 0–9
+      code === 95                      // underscore _
+    );
+  }
+
+  let start = pos;
+  let end = pos;
+
+  while (start > 0 && isWordChar(text[start - 1])) start--;
+  while (end < text.length && isWordChar(text[end])) end++;
+
+  return start < end ? text.slice(start, end) : '';
 }
 
 export type DefsUsagesOptions = {
@@ -311,7 +334,7 @@ class DefinitionsUsagesFinder extends ASTVisitor<DefUsageScope> {
         symbolName = parts.slice(1).join('.');
       }
 
-      if (!this.isSymbolDefined(symbolName) && !hasGlobalSymbol(symbolName)) {
+      if (!this.isSymbolDefined(symbolName) && !getGlobalSymbols(symbolName).some(s => s.name === symbolName)) {
         if (!isMemberExpression && symbolName !== 'self') {
           // Only create warnings for non-member variables
           usages.forEach(loc => {
@@ -435,10 +458,6 @@ class DefinitionsUsagesFinder extends ASTVisitor<DefUsageScope> {
     // Don't add the usage if it's the exact same as the most recent one added
     if (!boundsEqual(loc, defUs.usages[defUs.usages.length - 1])) {
       defUs.usages.push(loc);
-    }
-
-    if (!this.isSymbolLocal(symbolName)) {
-      addReference(symbolName, loc);
     }
 
     // if it's a global variable getting reassigned, add it to the definitions list as well

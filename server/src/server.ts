@@ -10,7 +10,7 @@ import Parser from './parser/parser';
 import { Bounds, boundsToString } from './parser/types';
 import { CodeSymbolType, CodeSymbol } from './parser/symbols';
 import {
-  DefinitionsUsages, DefinitionsUsagesLookup, DefUsageScope, findDefinitionsUsages,
+  DefinitionsUsagesLookup, DefUsageScope, findDefinitionsUsages,
 } from './parser/definitions-usages';
 import { isParseError, ParseError, Warning } from './parser/errors';
 import { Builtins, BuiltinFunctionInfo } from './parser/builtins';
@@ -24,16 +24,12 @@ import {
 import * as url from 'url';
 import * as fs from 'fs';
 import * as path from 'path';
-import { getReferences, clearReferences } from './parser/workspace-references';
-import { addGlobalSymbols, clearGlobalSymbols } from './parser/workspace-symbols';
-import { findSymbols } from './parser/symbols';
+import { indexText, collectGlobalSymbols } from './parser/global-indexer';
+import { getGlobalSymbols } from './parser/workspace-symbols';
+
 
 const connection = createConnection(ProposedFeatures.all);
-
-const documents = new TextDocuments(TextDocument);
-
-const globalSymbolTable: Map<string, Set<string>> = new Map(); 
-const locationMap: Map<string, Location> = new Map();         
+const documents = new TextDocuments(TextDocument);         
 
 let hasConfigurationCapability = false;
 let hasWorkspaceFolderCapability = false;
@@ -97,6 +93,61 @@ connection.onInitialized(() => {
   rescanEverything();
 });
 
+connection.onDefinition((params: DefinitionParams) => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+
+  const line = doc.getText().split('\n')[params.position.line] || '';
+  const word = identifierAtPosition(params.position.character, line);
+  if (!word) return [];
+
+  const symbols = getGlobalSymbols(word);
+  if (!symbols || symbols.length === 0) return [];
+
+  return symbols.map(sym => ({
+    uri: sym.loc.start.filename.fileURL,
+    range: {
+      start: {
+        line: sym.loc.start.line - 1,
+        character: sym.loc.start.column,
+      },
+      end: {
+        line: sym.loc.end.line - 1,
+        character: sym.loc.end.column,
+      },
+    },
+  }));
+});
+
+connection.onReferences((params: ReferenceParams) => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+
+  const line = doc.getText().split('\n')[params.position.line] || '';
+  const word = identifierAtPosition(params.position.character, line);
+  if (!word) return [];
+
+  const results: Location[] = [];
+
+  for (const [uri, content] of documentTextCache.entries()) {
+    const lines = content.getText().split('\n');
+    lines.forEach((line, i) => {
+      const index = line.indexOf(word);
+      if (index !== -1 && new RegExp(`\\b${word}\\b`).test(line)) {
+        results.push({
+          uri,
+          range: {
+            start: Position.create(i, index),
+            end: Position.create(i, index + word.length),
+          },
+        });
+      }
+    });
+  }
+
+  return results;
+});
+
 function rescanEverything() {
   connection.workspace.getWorkspaceFolders().then((workspaceFolders: WorkspaceFolder[] | null) => {
     if (!workspaceFolders) {
@@ -110,40 +161,6 @@ function rescanEverything() {
     console.log('Failed to get workspace folder(s):', reason);
   });
 }
-
-function makeLocation(uri: string, lineNum: number, line: string): Location {
-  return {
-    uri,
-    range: {
-      start: Position.create(lineNum, 0),
-      end: Position.create(lineNum, line.length),
-    },
-  };
-}
-
-function addSymbol(name: string, loc: Location) {
-  const key = `${loc.uri}:${loc.range.start.line}:${loc.range.start.character}`;
-  if (!globalSymbolTable.has(name)) globalSymbolTable.set(name, new Set());
-  globalSymbolTable.get(name)!.add(key);
-  locationMap.set(key, loc);
-}
-
-function indexText(uri: string, text: string) {
-  const lines = text.split('\n');
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const stripped = line.trim();
-    if (stripped.startsWith('--') || stripped === '') continue;
-
-    const varMatch = line.match(/^\s*(\w+)\s*=\s*{/);
-    if (varMatch) addSymbol(varMatch[1], makeLocation(uri, i, line));
-
-    const funcMatch = line.match(/^function\s+(\w+)\s*\(/);
-    if (funcMatch) addSymbol(funcMatch[1], makeLocation(uri, i, line));
-  }
-}
-
 
 async function scanWorkspaceFolder(workspaceFolder: WorkspaceFolder) {
   const folderPath = url.fileURLToPath(workspaceFolder.uri);
@@ -221,18 +238,6 @@ function rebuildProjectTree() {
   }
 
   collectGlobalSymbols(projects);
-}
-
-function collectGlobalSymbols(projects: Project[]) {
-  clearGlobalSymbols();
-  clearReferences();
-
-  for (const project of projects) {
-    iterateProject(project, node => {
-      const symbols = findSymbols(node.document.chunk);
-      addGlobalSymbols(symbols);
-    });
-  }
 }
 
 function findDefUsagesForProject(project: Project) {
@@ -437,23 +442,6 @@ connection.onDidChangeConfiguration(change => {
   rescanEverything();
 });
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function getDocumentSettings(resource: string): Thenable<DocumentSettings> {
-  if (!hasConfigurationCapability) {
-    return Promise.resolve(globalSettings);
-  }
-
-  let result = documentSettings.get(resource);
-  if (!result) {
-    result = connection.workspace.getConfiguration({
-      scopeUri: resource,
-      section: 'pico8-ls',
-    });
-    documentSettings.set(resource, result);
-  }
-  return result;
-}
-
 const symbolTypeLookup = {
   [CodeSymbolType.Function]: SymbolKind.Function,
   [CodeSymbolType.LocalVariable]: SymbolKind.Variable,
@@ -551,34 +539,6 @@ function parseTextDocument(textDocument: TextDocument): ProjectDocument | undefi
 
 connection.onDocumentSymbol((params: DocumentSymbolParams) => {
   return documentSymbols.get(params.textDocument.uri);
-});
-
-function getDefinitionsUsagesForPosition(params: TextDocumentPositionParams): DefinitionsUsages | undefined {
-  const lookup = documentDefUsage.get(params.textDocument.uri);
-  if (!lookup) {
-    console.log(`Definition/usages lookup table unavailable for ${params.textDocument.uri} -- re-scanning`);
-    rescanEverything();
-    return undefined;
-  }
-
-  return lookup.lookup(
-    // They use 0-index line numbers, we use 1-index
-    params.position.line + 1,
-    params.position.character);
-}
-
-connection.onDefinition((params: DefinitionParams) => {
-  const doc = documents.get(params.textDocument.uri);
-  if (!doc) return [];
-
-  const line = doc.getText().split('\n')[params.position.line] || '';
-  const word = identifierAtPosition(params.position.character, line);
-  if (!word) return [];
-
-  const locKeys = globalSymbolTable.get(word);
-  if (!locKeys) return [];
-
-  return Array.from(locKeys).map(k => locationMap.get(k)!);
 });
 
 connection.onReferences((params: ReferenceParams) => {
@@ -863,11 +823,52 @@ function executeCommand_formatDocument(documentUri: string, opts: FormatterOptio
   );
 }
 
+function refreshDocument(document: TextDocument) {
+  const parsed = parseTextDocument(document);
+  if (!parsed) {
+    return;
+  }
+
+  parsedDocuments.set(document.uri, parsed);
+
+  const project = projectsByFilename.get(document.uri);
+  if (project) {
+    const projFiles = getProjectFiles(project);
+    for (const file of projFiles) {
+      const doc = documents.get(file);
+      if (!doc) continue;
+      const reParsed = parseTextDocument(doc);
+      if (reParsed) {
+        parsedDocuments.set(doc.uri, reParsed);
+      }
+    }
+
+    refreshProject(project);
+    findDefUsagesForProject(project);
+  } else {
+    console.warn(`[refreshDocument] No project found for ${document.uri}`);
+  }
+
+  collectGlobalSymbols(projects);
+  rescanEverything();
+}
+
 // Make the text document manager listen on the connection
 // for open, change and close text document events
 documents.listen(connection);
 
+documents.onDidOpen(e => {
+  refreshDocument(e.document);
+});
+
+documents.onDidChangeContent(e => {
+  refreshDocument(e.document);
+  parseTextDocument(e.document);
+});
+
+documents.onDidSave(e => {
+  refreshDocument(e.document);
+});
+
 // Listen on the connection
 connection.listen();
-
-console.log('PICO-8 Language Server launched.');
