@@ -3,6 +3,8 @@ import { Chunk } from './parser/statements';
 import * as url from 'url';
 import * as path from 'path';
 import { ParseError } from './parser/errors';
+import { addGlobalSymbols, clearGlobalSymbols } from './parser/workspace-symbols';
+import { findSymbols } from './parser/symbols';
 
 export type ProjectDocument = { textDocument: TextDocument, chunk: Chunk, errors: ParseError[] };
 
@@ -58,6 +60,17 @@ export function findProjects(parsedDocuments: ParsedDocumentsMap): Project[] {
     .map(node => {
       return { root: node };
     });
+}
+
+export function collectGlobalSymbols(projects: Project[]) {
+  clearGlobalSymbols();
+
+  for (const project of projects) {
+    iterateProject(project, node => {
+      const symbols = findSymbols(node.document.chunk);
+      addGlobalSymbols(symbols);
+    });
+  }
 }
 
 function findProjectsRecursive(current: string, visited: Map<string, ProjectDocumentNode>, parsedDocuments: ParsedDocumentsMap): ProjectDocumentNode | undefined {

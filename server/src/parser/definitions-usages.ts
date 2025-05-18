@@ -6,6 +6,8 @@ import { AssignmentStatement, Chunk, ForGenericStatement, ForNumericStatement, F
 import { Bounds, boundsEqual, boundsSize, CodeLocation } from './types';
 import { ASTVisitor, VisitableASTNode } from './visitor';
 import { BuiltinConstants, Builtins } from './builtins';
+import { hasGlobalSymbol } from './workspace-symbols';
+import { addReference } from './workspace-references';
 
 export type DefinitionsUsagesResult = {
   definitionsUsages: DefinitionsUsagesLookup,
@@ -309,7 +311,7 @@ class DefinitionsUsagesFinder extends ASTVisitor<DefUsageScope> {
         symbolName = parts.slice(1).join('.');
       }
 
-      if (!this.isSymbolDefined(symbolName)) {
+      if (!this.isSymbolDefined(symbolName) && !hasGlobalSymbol(symbolName)) {
         if (!isMemberExpression && symbolName !== 'self') {
           // Only create warnings for non-member variables
           usages.forEach(loc => {
@@ -433,6 +435,10 @@ class DefinitionsUsagesFinder extends ASTVisitor<DefUsageScope> {
     // Don't add the usage if it's the exact same as the most recent one added
     if (!boundsEqual(loc, defUs.usages[defUs.usages.length - 1])) {
       defUs.usages.push(loc);
+    }
+
+    if (!this.isSymbolLocal(symbolName)) {
+      addReference(symbolName, loc);
     }
 
     // if it's a global variable getting reassigned, add it to the definitions list as well

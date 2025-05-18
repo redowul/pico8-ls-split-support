@@ -24,12 +24,16 @@ import {
 import * as url from 'url';
 import * as fs from 'fs';
 import * as path from 'path';
-
-console.log('PICO-8 Language Server starting.');
+import { getReferences, clearReferences } from './parser/workspace-references';
+import { addGlobalSymbols, clearGlobalSymbols } from './parser/workspace-symbols';
+import { findSymbols } from './parser/symbols';
 
 const connection = createConnection(ProposedFeatures.all);
 
 const documents = new TextDocuments(TextDocument);
+
+const globalSymbolTable: Map<string, Set<string>> = new Map(); 
+const locationMap: Map<string, Location> = new Map();         
 
 let hasConfigurationCapability = false;
 let hasWorkspaceFolderCapability = false;
@@ -107,20 +111,52 @@ function rescanEverything() {
   });
 }
 
+function makeLocation(uri: string, lineNum: number, line: string): Location {
+  return {
+    uri,
+    range: {
+      start: Position.create(lineNum, 0),
+      end: Position.create(lineNum, line.length),
+    },
+  };
+}
+
+function addSymbol(name: string, loc: Location) {
+  const key = `${loc.uri}:${loc.range.start.line}:${loc.range.start.character}`;
+  if (!globalSymbolTable.has(name)) globalSymbolTable.set(name, new Set());
+  globalSymbolTable.get(name)!.add(key);
+  locationMap.set(key, loc);
+}
+
+function indexText(uri: string, text: string) {
+  const lines = text.split('\n');
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const stripped = line.trim();
+    if (stripped.startsWith('--') || stripped === '') continue;
+
+    const varMatch = line.match(/^\s*(\w+)\s*=\s*{/);
+    if (varMatch) addSymbol(varMatch[1], makeLocation(uri, i, line));
+
+    const funcMatch = line.match(/^function\s+(\w+)\s*\(/);
+    if (funcMatch) addSymbol(funcMatch[1], makeLocation(uri, i, line));
+  }
+}
+
+
 async function scanWorkspaceFolder(workspaceFolder: WorkspaceFolder) {
   const folderPath = url.fileURLToPath(workspaceFolder.uri);
 
-  // List all files in directory & subdirs
   const allFiles = await getFilesRecursive(folderPath);
-
-  // Load contents of each file & transform to TextDocument type
   const textDocuments = await Promise.all(allFiles.map(createTextDocument));
+  for (const doc of textDocuments) {
+    indexText(doc.uri, doc.getText()); 
+  }
 
-  // Parse each file
   parsedDocuments =
     textDocuments.map(parseTextDocument)
       .filter(chunk => !!chunk)
-    // Put the result into a map for lookup by file uri
       .reduce((dict, curr) => {
         dict.set(curr!.textDocument.uri, curr!);
         return dict;
@@ -128,7 +164,6 @@ async function scanWorkspaceFolder(workspaceFolder: WorkspaceFolder) {
 
   rebuildProjectTree();
 
-  // Now we have the project tree, we can FINALLY finish parsing all the files.
   projects.forEach(findDefUsagesForProject);
 }
 
@@ -183,6 +218,20 @@ function rebuildProjectTree() {
   };
   for (const project of projects) {
     iterateNode(project.root, project);
+  }
+
+  collectGlobalSymbols(projects);
+}
+
+function collectGlobalSymbols(projects: Project[]) {
+  clearGlobalSymbols();
+  clearReferences();
+
+  for (const project of projects) {
+    iterateProject(project, node => {
+      const symbols = findSymbols(node.document.chunk);
+      addGlobalSymbols(symbols);
+    });
   }
 }
 
@@ -518,54 +567,47 @@ function getDefinitionsUsagesForPosition(params: TextDocumentPositionParams): De
     params.position.character);
 }
 
-function boundsToLocation(bounds: Bounds): Location {
-  return {
-    uri: bounds.start.filename.fileURL,
-    range: {
-      start: { line: bounds.start.line - 1, character: bounds.start.column },
-      end: { line: bounds.end.line - 1, character: bounds.end.column },
-    },
-  };
-}
-
 connection.onDefinition((params: DefinitionParams) => {
-  const includes = documentIncludes.get(params.textDocument.uri);
-  if (includes) {
-    // They use 0-index line numbers, we use 1-index
-    const line = params.position.line + 1;
-    const column = params.position.character;
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
 
-    for (const include of includes) {
-      const loc = include.stmt.loc!;
-      if (line === loc.start.line && column >= loc.start.column && column <= loc.end.column) {
-        const ret: Location = {
-          uri: include.resolvedFile.fileURL,
-          // We're just linking to the entire included file, so the range is the whole thing
-          range: {
-            start: { line: 0, character: 0 },
-            end: { line: Number.MAX_SAFE_INTEGER, character: 0 },
-          },
-        };
-        return [ ret ];
-      }
-    }
-  }
+  const line = doc.getText().split('\n')[params.position.line] || '';
+  const word = identifierAtPosition(params.position.character, line);
+  if (!word) return [];
 
-  const result = getDefinitionsUsagesForPosition(params);
-  if (!result) {
-    return [];
-  }
+  const locKeys = globalSymbolTable.get(word);
+  if (!locKeys) return [];
 
-  return result.definitions.map(bounds => boundsToLocation(bounds));
+  return Array.from(locKeys).map(k => locationMap.get(k)!);
 });
 
 connection.onReferences((params: ReferenceParams) => {
-  const result = getDefinitionsUsagesForPosition(params);
-  if (!result) {
-    return [];
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+
+  const line = doc.getText().split('\n')[params.position.line] || '';
+  const word = identifierAtPosition(params.position.character, line);
+  if (!word) return [];
+
+  const results: Location[] = [];
+
+  for (const [uri, content] of documentTextCache.entries()) {
+    const lines = content.getText().split('\n');
+    lines.forEach((line, i) => {
+      const index = line.indexOf(word);
+      if (index !== -1 && new RegExp(`\\b${word}\\b`).test(line)) {
+        results.push({
+          uri,
+          range: {
+            start: Position.create(i, index),
+            end: Position.create(i, index + word.length),
+          },
+        });
+      }
+    });
   }
 
-  return result.usages.map(bounds => boundsToLocation(bounds));
+  return results;
 });
 
 connection.onDidChangeWatchedFiles(_change => {
@@ -673,25 +715,14 @@ function completionFilterForPosition(position: number, text: string) {
   };
 }
 
-function identifierAtPosition(position: number, text: string) {
-  let i;
-  for (i = position; i >= 0; i--) {
-    if (!isIdentifierPart(text.charCodeAt(i))) {
-      i++;
-      break;
-    }
-  }
-  const begin = i;
+function identifierAtPosition(position: number, line: string): string {
+  let i = position;
+  while (i > 0 && /[a-zA-Z0-9_]/.test(line[i - 1])) i--;
+  const start = i;
 
-  for (i = position; i < text.length; i++) {
-    if (!isIdentifierPart(text.charCodeAt(i))) {
-      break;
-    }
-
-  }
-  const end = i;
-
-  return text.substring(begin, end);
+  i = position;
+  while (i < line.length && /[a-zA-Z0-9_]/.test(line[i])) i++;
+  return line.slice(start, i);
 }
 
 function getTextOnLine(textDocumentUri: string, position: Position): string | undefined {
